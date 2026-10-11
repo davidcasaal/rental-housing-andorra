@@ -1,9 +1,17 @@
 import json
+import os
 import time
 from typing import Literal
 
 import requests
+from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
+
+from andorra_housing.scraping.base_scraper import PROJECT_ROOT
+
+# Se ancla a PROJECT_ROOT (no al directorio actual) para que cargue el .env
+# correcto sin importar desde dónde se ejecute el código (notebook, script, terminal...).
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 class ExtraccionLLM(BaseModel):
@@ -20,8 +28,8 @@ class ExtraccionLLM(BaseModel):
     has_storage_llm: bool | None = None
 
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODELO = "qwen2.5:7b"
+OLLAMA_URL = os.environ["OLLAMA_URL"]
+MODELO = os.environ["MODELO"]
 
 VALORES_FURNISHED_COLADOS_EN_CONDITION = {
     "amueblado", "semi", "vacio", "furnished", "sin muebles",

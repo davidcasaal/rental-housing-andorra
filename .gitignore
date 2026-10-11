@@ -25,3 +25,6 @@ data/*.duckdb.wal
 
 # Notas personales de aprendizaje, no forman parte del proyecto
 aprender.md
+
+# environement
+.env

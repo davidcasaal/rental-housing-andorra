@@ -1,10 +1,16 @@
+import os
 from datetime import date
 
 import duckdb
+from dotenv import load_dotenv
 
 from andorra_housing.scraping.base_scraper import PROJECT_ROOT
 
-DB_PATH = PROJECT_ROOT / "data" / "andorra_housing.duckdb"
+load_dotenv(PROJECT_ROOT / ".env")
+
+# DB_PATH en .env es relativa a la raíz del proyecto (ej. "data/andorra_housing.duckdb"),
+# por eso se combina con PROJECT_ROOT -- así sigue siendo independiente de desde dónde se ejecute.
+DB_PATH = PROJECT_ROOT / os.environ["DB_PATH"]
 
 
 def conectar() -> duckdb.DuckDBPyConnection:
