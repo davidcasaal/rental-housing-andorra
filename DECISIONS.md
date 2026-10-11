@@ -250,3 +250,78 @@ WHERE expenses_included IS NOT NULL AND (expenses_detail IS NULL OR expenses_det
 **Alternativas descartadas:**
 - Asumir automáticamente que toda discrepancia "estructurado=No, LLM=Sí" es correcta sin revisión manual: descartada — aunque el patrón agregado apunta a eso, confirmarlo caso a caso da certeza real en vez de una suposición basada en el agregado, y permite detectar excepciones dentro del patrón dominante.
 - Guardar los veredictos solo en un DataFrame de Python, no en la base de datos: descartada por la misma razón de robustez que ya aplicamos al scraping (no perder progreso ante una interrupción).
+
+---
+
+## 2026-09-22 — Conclusión de la revisión manual de `avisos`: regla de confianza por dirección de la discrepancia
+
+**Decisión, tras revisar a mano los ~100 avisos generados por pisos.ad:** confirmado el patrón que se sospechaba en la entrada anterior, sin excepciones relevantes:
+- **Estructurado = No, LLM = Sí** → el LLM tiene razón siempre. La casilla no estaba marcada, pero el texto libre sí menciona la característica. El OR ya deja esto bien en `anuncios`, sin más acción.
+- **Estructurado = Sí, LLM = No** → el LLM alucina, la casilla tiene razón. En estos casos el LLM afirmó explícitamente la ausencia de una característica que el texto no mencionaba en absoluto (o mencionaba lo contrario), y la casilla estructurada resultó ser la fuente fiable.
+
+**Implicación práctica para el futuro** (no implementada todavía, anotada para cuando se automatice más): en caso de discrepancia, se puede confiar en el LLM cuando dice que SÍ hay una característica, y desconfiar de él cuando dice que NO hay una que el estructurado afirma — es decir, el OR que ya aplicábamos (quedarse con `True` si cualquiera de las dos fuentes lo dice) queda validado como la regla correcta con los datos reales, no solo como supuesto de diseño.
+
+---
+
+## 2026-09-22 — Duplicados dentro del mismo portal: detección por hash de descripción, antes del paso LLM
+
+**Hallazgo:** durante la revisión manual de avisos, se detectó que los anuncios `9209` y `9305` son el **mismo piso** publicado dos veces en pisos.ad (misma descripción, misma URL de fondo) — un duplicado dentro del propio portal, no entre portales distintos (ese caso ya estaba previsto en el plan para más adelante, pero este es distinto: ni siquiera hemos llegado a idealista/fotocasa y ya hay duplicados). Comprobando `hash_descripcion` sobre los 115 anuncios que ya lo tenían calculado, aparecieron **3 pares duplicados** en total (`8775/9545`, `9209/9305`, `9637/8646`) — más de los que se habían detectado a ojo.
+
+**Por qué se necesita calcular el hash ANTES del paso LLM, no después (como se hace ahora):** actualmente `hash_descripcion` solo se rellena dentro de `guardar_extraccion_llm`, es decir, solo si la descripción se procesó con éxito por el LLM. De los 126 anuncios guardados, 11 no tienen `hash_descripcion` (fallos de LLM o sin descripción) — esos 11 no se pueden comprobar contra duplicados con el método actual. Calculando el hash en el momento de parsear la ficha (antes de decidir si se llama al LLM), todos los anuncios quedan cubiertos por la comprobación de duplicados, sin excepción.
+
+**Decisión de diseño para la próxima vez que se toque el pipeline de scraping** (pendiente de implementar, no se ejecuta todavía):
+1. Al parsear una ficha nueva, calcular `hash_descripcion` inmediatamente, antes de llamar al LLM.
+2. Comparar ese hash contra los ya guardados en `anuncios`. Si ya existe → es un duplicado: no se guarda como anuncio nuevo, no se llama al LLM para él (ya sería trabajo repetido para un piso que ya tenemos).
+3. En su lugar, se guarda una fila en una tabla nueva, `repetidos`: `url`, `portal_id` (el del duplicado encontrado), y qué `portal_id` es el que **sí** quedó guardado en `anuncios` (el original) — para poder auditar después cuántos duplicados hubo y cuáles eran.
+
+**Alternativas descartadas:**
+- Seguir calculando el hash solo tras el éxito del LLM: descartada — deja huecos de cobertura (los fallos de LLM nunca se comprueban contra duplicados), como ya se ha visto con los 11 casos sin hash.
+- No guardar constancia de los duplicados encontrados (simplemente descartarlos en silencio): descartada — se pierde la trazabilidad de cuántos duplicados había y cuáles eran, útil para auditar la calidad del dataset final.
+
+**Implementado el mismo día** (puntos 1-3 de arriba, en `pisos_ad.py`/`almacenamiento.py`):
+- `procesar()` calcula `hash_descripcion` justo después de sacar la descripción, antes de decidir nada más.
+- `guardar_ficha()` ya guarda `hash_descripcion` al insertar (columna añadida al `INSERT`) — `guardar_extraccion_llm()` ya no la toca, porque ya está puesta desde el principio.
+- Tabla nueva `repetidos` (`portal`, `portal_id`, `url`, `portal_id_original`, `fecha`), con `guardar_repetido()` para registrar cada duplicado detectado.
+- `reintentar_fallos()` también revisado: al reintentar un fallo antiguo (de los 11 sin hash), calcula el hash, comprueba si resulta ser un duplicado tardío (`portal_id_original`) y, si no lo es, rellena `hash_descripcion` con `actualizar_hash_descripcion()` — así los 11 casos antiguos quedan cubiertos la próxima vez que se reintenten, sin necesitar un script de migración aparte.
+
+---
+
+## 2026-09-25 — Dos correcciones más sobre la extracción LLM: prompt (condition/furnished) y reintento ante cortes de Ollama
+
+**Corrección del prompt — el modelo confundía `condition` con `furnished`:** en varios fallos de `fallos_llm`, el modelo devolvía `"condition": "amueblado"` (copiando el valor de `furnished` también ahí) o, tras una primera corrección que nombraba explícitamente el campo `"furnished"` en la aclaración, empezó a devolver literalmente `"condition": "furnished"` — el modelo se quedó con esa palabra de la propia instrucción y la usó como valor. Arreglo final: la aclaración ya no nombra el otro campo por su nombre en inglés, ni muestra un ejemplo con las dos claves juntas (ni siquiera marcado como "MAL") — solo describe en prosa que son dos preguntas distintas, sin darle al modelo ningún token literal que pueda copiar por error.
+
+**Lección general:** al corregir un prompt por un error de un modelo, cuidado con **introducir la propia palabra del error** en la aclaración — el modelo puede quedarse con esa palabra y repetirla en el sitio equivocado, en vez de entender la regla. Mejor describir la distinción sin nombrar directamente el campo/valor problemático, y evitar poner ejemplos "de lo que NO hay que hacer" con el formato exacto del error (aunque estén marcados como incorrectos).
+
+**`extraer_de_descripcion` reintenta ante cortes con Ollama** (mismo patrón que `descargar_html` con pisos.ad): durante un reintento de `fallos_llm`, la petición a Ollama (`localhost:11434`) dio un `ReadTimeout` a los 60s, con el servidor y el modelo confirmados como activos justo después — un corte transitorio (posible recarga del modelo en memoria), no un problema de la descripción. Se añaden hasta 3 reintentos con 5s de espera, igual que en `descargar_html`.
+
+---
+
+## 2026-09-25 — Investigación: modelo de decisión "Kev" (alternativa open-source a Jev) para la extracción categórica — descartado por ahora
+
+**Contexto:** tras la tercera vuelta de ajuste de prompt para el mismo bug (`condition` confundido con `furnished`), se investigó si un modelo de decisión tipo Jev/Kev (que responde preguntas tipadas con probabilidades calibradas, en un único forward pass, en vez de generar texto libre) resolvería el problema de raíz al hacer estructuralmente imposible que el modelo devuelva un valor fuera del esquema.
+
+**Cómo funciona Kev (`jaredpalmer/kev`, Apache-2.0, familia de modelos sobre Qwen3.5/3.8, 0.8B/4B/9B/27B):** se le pasa un texto (`state`) y un diccionario de preguntas tipadas (`noul` = sí/no, `choice` = opción cerrada, `score` = nivel ordenado) en una sola petición HTTP (`POST /v1/systemone`); el modelo procesa el texto una vez y responde todas las preguntas en paralelo con probabilidades calibradas, sin generación autoregresiva. No hay tipo de pregunta para números libres ni texto libre.
+
+**Por qué se descarta por ahora, a pesar de encajar conceptualmente:**
+1. **Esquema partido en dos:** de nuestros 7 campos LLM, solo `condition`, `furnished`, `expenses_included` y los 4 `has_X_llm` encajan como preguntas `choice`/`noul`. `construction_year`, `renovation_year`, `n_parking_spaces` (números) y `expenses_detail` (texto libre) no tienen tipo de pregunta en Kev — seguiríamos necesitando un LLM generativo (Ollama) en paralelo para esos campos. Es decir, no sustituye la extracción actual, la duplica en dos servidores distintos.
+2. **Dominio de entrenamiento no coincide:** el dataset de entrenamiento (`decision-v7`) es de datasets públicos en inglés (routing de tickets, entailment, preguntas de ciencia) — nada en catalán/español, nada de dominio inmobiliario. El propio README recomienda un fine-tune corto cuando el idioma o las preguntas son distintas a las de entrenamiento, que es exactamente nuestro caso.
+3. **Hardware local insuficiente para la versión con precisión decente:** el Mac de desarrollo tiene 16 GB RAM (Apple M2). Kev-4B (accuracy ~0.82 en "new sources", el escenario más parecido al nuestro) necesita 32 GB. Solo cabría Kev-0.8B, con accuracy notablemente peor (~0.65-0.70 en "new sources") — justo el escenario donde más nos jugamos la precisión, porque nuestro dominio es "nuevo" para el modelo.
+4. **Coste de infraestructura no proporcional al problema:** añadir un segundo servidor local (entorno Python 3.12/3.13 vía `uv`, `torch`, `peft`, `transformers`, MLX — el proyecto usa Python 3.14, no compatible con `torch` todavía) para resolver un bug que la limpieza defensiva en post-procesado (ver decisión de la misma fecha, más abajo) ya resuelve con cero dependencias nuevas.
+
+**Alternativas descartadas:** ninguna otra investigada en profundidad — Kev fue la única opción concreta evaluada, precisamente porque encajaba mejor que cualquier otra en la lógica del problema (respuestas restringidas a un esquema cerrado).
+
+**Reconsiderar si:** el proyecto crece a más portales (idealista, fotocasa) con volumen suficiente para justificar un fine-tune de Kev usando como datos de entrenamiento los ejemplos ya revisados manualmente en `avisos.veredicto` (que ya son, de facto, un pequeño dataset etiquetado); o si la limpieza defensiva en post-procesado no basta para otros campos categóricos que aparezcan más adelante.
+
+---
+
+## 2026-09-25 — Corrección definitiva de `condition`/`furnished`: limpieza defensiva en post-procesado, no más prompt engineering
+
+**Problema:** tras tres rondas de ajustes de prompt (ver decisión anterior de la misma fecha), el modelo seguía devolviendo `"condition": "amueblado"` para descripciones que mencionan mobiliario — un sesgo persistente del modelo de 7B que el prompt no consigue eliminar de forma fiable, con retornos decrecientes en cada intento.
+
+**Decisión:** en vez de seguir puliendo el prompt, se añade una limpieza defensiva **antes** de validar con Pydantic: si `datos["condition"]` llega con uno de los valores que sabemos que son intrusiones del campo `furnished` (`"amueblado"`, `"semi"`, `"vacio"`, `"furnished"`, `"sin muebles"`), se fuerza a `None` en vez de dejar que la validación de Pydantic rechace la extracción entera. Así no se pierden los demás campos (que sí suelen venir bien) solo porque `condition` vino mal, y se deja de depender de que el modelo obedezca perfectamente una instrucción negativa.
+
+**Por qué no es lo mismo que "confiar menos en el dato":** los valores que se limpian nunca eran válidos para `condition` (no están en el `Literal` del esquema) — antes esos casos acababan en `fallos_llm` sin ningún valor aprovechable; ahora se recupera el resto de la extracción y `condition` queda como `null`, que es semánticamente correcto (el modelo no dio ninguna pista válida sobre el estado físico de la vivienda en ese intento).
+
+**Alternativas descartadas:**
+- Cuarta ronda de ajuste de prompt: descartada por los retornos decrecientes ya observados en las tres rondas anteriores.
+- Migrar a un modelo de decisión tipo Kev: descartado por ahora (ver decisión anterior).
