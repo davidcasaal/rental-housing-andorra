@@ -1,3 +1,4 @@
+import argparse
 import re
 import time
 from datetime import date
@@ -353,4 +354,25 @@ def reintentar_fallos() -> None:
         almacenamiento.borrar_fallo_llm(conexion, "pisos_ad", portal_id)
 
     conexion.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--accion",
+        required=True,
+        choices=["ejecutar", "reintentar_fallos"],
+        help="Qué acción realizar: 'ejecutar' para recorrer todo pisos.ad, o "
+             "'reintentar_fallos' para procesar los anuncios que fallaron antes con el LLM.",
+    )
+    args = parser.parse_args()
+
+    if args.accion == "ejecutar":
+        ejecutar()
+    elif args.accion == "reintentar_fallos":
+        reintentar_fallos()
+
+
+if __name__ == "__main__":
+    main()
     
