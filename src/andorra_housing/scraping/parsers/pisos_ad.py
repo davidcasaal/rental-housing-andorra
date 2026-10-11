@@ -214,7 +214,6 @@ def _combinar_y_guardar_extraccion(
     valores_estructurados: dict con has_terrace/has_balcony/has_elevator/has_storage ya extraídos del HTML.
     Compartido entre el flujo normal (procesar) y el de reintento (reintentar_fallos).
     """
-    hash_descripcion = calcular_hash(descripcion)
     combinados = {}
     for nombre_campo, valor_llm in [
         ("has_terrace", extraccion.has_terrace_llm),
@@ -231,7 +230,7 @@ def _combinar_y_guardar_extraccion(
             )
 
     almacenamiento.guardar_extraccion_llm(
-        conexion, "pisos_ad", portal_id, hash_descripcion, extraccion,
+        conexion, "pisos_ad", portal_id, extraccion,
         combinados["has_terrace"], combinados["has_balcony"],
         combinados["has_elevator"], combinados["has_storage"],
     )
@@ -248,15 +247,29 @@ def ejecutar() -> None:
 
     def procesar(ficha: dict) -> None:
         nonlocal contador_nuevos
+        portal_id = ficha["portal_id"]
+        descripcion = ficha["descripcion_raw"]
+
+        if descripcion:
+            hash_descripcion = calcular_hash(descripcion)
+            portal_id_original = almacenamiento.buscar_por_hash(conexion, "pisos_ad", hash_descripcion)
+            if portal_id_original is not None:
+                # Mismo texto de descripción que un anuncio que YA tenemos guardado: es el mismo
+                # piso publicado dos veces. No se guarda como fila nueva ni se llama al LLM para él.
+                print(f"    -> DUPLICADO: {portal_id} = {portal_id_original}, no se guarda, va a repetidos")
+                almacenamiento.guardar_repetido(conexion, "pisos_ad", ficha["url"], portal_id, portal_id_original)
+                return
+            ficha["hash_descripcion"] = hash_descripcion
+        else:
+            ficha["hash_descripcion"] = None
+
         almacenamiento.guardar_ficha(conexion, ficha)
         contador_nuevos += 1
-        print(f"    -> guardado como nuevo (portal_id={ficha['portal_id']})")
+        print(f"    -> guardado como nuevo (portal_id={portal_id})")
 
-        descripcion = ficha["descripcion_raw"]
         if not descripcion:
             return  # sin descripción, no hay nada que pasarle al LLM
 
-        portal_id = ficha["portal_id"]
         extraccion, texto_crudo = extraer_de_descripcion(descripcion)
         if extraccion is None:
             print(f"    -> LLM: no se pudo extraer/validar para {portal_id}, guardado en fallos_llm")
@@ -310,12 +323,26 @@ def reintentar_fallos() -> None:
             continue
 
         print(f"Ahora sí funciona para {portal_id}.")
+
+        # Este anuncio nunca tuvo hash_descripcion calculado (falló antes de llegar a esa parte).
+        # Al reintentar, aprovechamos para rellenarlo, y también para comprobar si resulta ser
+        # un duplicado tardío de otro anuncio que sí se guardó bien.
+        hash_descripcion = calcular_hash(descripcion)
+        portal_id_original = almacenamiento.buscar_por_hash(conexion, "pisos_ad", hash_descripcion)
         fila = conexion.execute(
-            "SELECT has_terrace, has_balcony, has_elevator, has_storage FROM anuncios"
+            "SELECT has_terrace, has_balcony, has_elevator, has_storage, url FROM anuncios"
             " WHERE portal = ? AND portal_id = ?",
             ("pisos_ad", portal_id),
         ).fetchone()
-        has_terrace, has_balcony, has_elevator, has_storage = fila
+        has_terrace, has_balcony, has_elevator, has_storage, url = fila
+
+        if portal_id_original is not None and portal_id_original != portal_id:
+            print(f"    AVISO: duplicado tardío detectado, {portal_id} = {portal_id_original}")
+            almacenamiento.guardar_repetido(conexion, "pisos_ad", url, portal_id, portal_id_original)
+            almacenamiento.borrar_fallo_llm(conexion, "pisos_ad", portal_id)
+            continue
+
+        almacenamiento.actualizar_hash_descripcion(conexion, "pisos_ad", portal_id, hash_descripcion)
         valores_estructurados = {
             "has_terrace": has_terrace,
             "has_balcony": has_balcony,
@@ -326,3 +353,4 @@ def reintentar_fallos() -> None:
         almacenamiento.borrar_fallo_llm(conexion, "pisos_ad", portal_id)
 
     conexion.close()
+    

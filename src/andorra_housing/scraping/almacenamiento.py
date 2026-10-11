@@ -77,6 +77,16 @@ def conectar() -> duckdb.DuckDBPyConnection:
             PRIMARY KEY (portal, portal_id)
         )
     """)
+    conexion.execute("""
+        CREATE TABLE IF NOT EXISTS repetidos (
+            portal TEXT NOT NULL,
+            portal_id TEXT NOT NULL,
+            url TEXT,
+            portal_id_original TEXT NOT NULL,
+            fecha DATE NOT NULL,
+            PRIMARY KEY (portal, portal_id)
+        )
+    """)
     conexion.commit()
     return conexion
 
@@ -182,6 +192,37 @@ def existe(conexion: duckdb.DuckDBPyConnection, portal: str, portal_id: str) -> 
     return fila is not None
 
 
+def buscar_por_hash(conexion: duckdb.DuckDBPyConnection, portal: str, hash_descripcion: str) -> str | None:
+    """Devuelve el portal_id de un anuncio ya guardado con esta misma huella de descripción, o None."""
+    fila = conexion.execute(
+        "SELECT portal_id FROM anuncios WHERE portal = ? AND hash_descripcion = ?",
+        (portal, hash_descripcion),
+    ).fetchone()
+    return fila[0] if fila else None
+
+
+def guardar_repetido(
+    conexion: duckdb.DuckDBPyConnection, portal: str, url: str, portal_id: str, portal_id_original: str
+) -> None:
+    """Registra un anuncio detectado como duplicado (misma descripción) de otro ya guardado."""
+    conexion.execute(
+        "INSERT OR REPLACE INTO repetidos (portal, url, portal_id, portal_id_original, fecha) VALUES (?, ?, ?, ?, ?)",
+        (portal, url, portal_id, portal_id_original, date.today()),
+    )
+    conexion.commit()
+
+
+def actualizar_hash_descripcion(
+    conexion: duckdb.DuckDBPyConnection, portal: str, portal_id: str, hash_descripcion: str
+) -> None:
+    """Rellena hash_descripcion en una fila que ya existe (para los fallos_llm antiguos, sin hash)."""
+    conexion.execute(
+        "UPDATE anuncios SET hash_descripcion = ? WHERE portal = ? AND portal_id = ?",
+        (hash_descripcion, portal, portal_id),
+    )
+    conexion.commit()
+
+
 def guardar_ficha(conexion: duckdb.DuckDBPyConnection, ficha: dict) -> None:
     """Inserta una ficha NUEVA. Asume que ya se comprobó con existe() que no estaba guardada."""
     hoy = date.today()
@@ -197,13 +238,13 @@ def guardar_ficha(conexion: duckdb.DuckDBPyConnection, ficha: dict) -> None:
         INSERT INTO anuncios (
             portal, portal_id, parish, property_type, price, price_m2, area_m2,
             rooms, bathrooms, has_parking, has_terrace, has_balcony, has_elevator,
-            has_storage, is_furnished, n_photos, title, descripcion_raw, agencia, url,
-            fecha_modificacion, primera_captura, ultima_vez_visto, activo, fecha_baja
+            has_storage, is_furnished, n_photos, title, descripcion_raw, hash_descripcion,
+            agencia, url, fecha_modificacion, primera_captura, ultima_vez_visto, activo, fecha_baja
         ) VALUES (
             $portal, $portal_id, $parish, $property_type, $price, $price_m2, $area_m2,
             $rooms, $bathrooms, $has_parking, $has_terrace, $has_balcony, $has_elevator,
-            $has_storage, $is_furnished, $n_photos, $title, $descripcion_raw, $agencia, $url,
-            $fecha_modificacion, $primera_captura, $ultima_vez_visto, $activo, $fecha_baja
+            $has_storage, $is_furnished, $n_photos, $title, $descripcion_raw, $hash_descripcion,
+            $agencia, $url, $fecha_modificacion, $primera_captura, $ultima_vez_visto, $activo, $fecha_baja
         )
         """,
         datos,
@@ -247,18 +288,19 @@ def guardar_extraccion_llm(
     conexion: duckdb.DuckDBPyConnection,
     portal: str,
     portal_id: str,
-    hash_descripcion: str,
     extraccion,
     has_terrace: bool,
     has_balcony: bool,
     has_elevator: bool,
     has_storage: bool,
 ) -> None:
-    """Guarda los campos extraídos por el LLM y las características ya combinadas (estructurado OR LLM)."""
+    """Guarda los campos extraídos por el LLM y las características ya combinadas (estructurado OR LLM).
+
+    hash_descripcion NO se toca aquí -- se guarda al insertar la ficha (guardar_ficha), antes del LLM.
+    """
     conexion.execute(
         """
         UPDATE anuncios SET
-            hash_descripcion = $hash_descripcion,
             condition = $condition,
             construction_year = $construction_year,
             renovation_year = $renovation_year,
@@ -278,7 +320,6 @@ def guardar_extraccion_llm(
         """,
         {
             **extraccion.model_dump(),
-            "hash_descripcion": hash_descripcion,
             "has_terrace": has_terrace,
             "has_balcony": has_balcony,
             "has_elevator": has_elevator,
